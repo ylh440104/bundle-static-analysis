@@ -1,0 +1,37 @@
+name: analyze
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+permissions:
+  contents: read
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: download
+        run: |
+          curl -fsSL --retry 3 -o ab.deb "https://download.scholar.edu.cn/AcademicBrowser/AcademicBrowser1.9.deb"
+          ls -l ab.deb
+          sha256sum ab.deb
+      - name: extract
+        run: |
+          mkdir -p out ctl
+          dpkg-deb -x ab.deb out/
+          dpkg-deb -e ab.deb ctl/
+          dpkg-deb -c ab.deb > files.txt
+          echo "file lines:"; wc -l files.txt
+          ls -l ctl
+      - name: scan
+        run: |
+          bash scan.sh > report.txt 2>&1
+          echo "report bytes:"; wc -c report.txt
+          head -300 report.txt
+      - name: upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report
+          path: report.txt

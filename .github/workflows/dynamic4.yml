@@ -1,0 +1,376 @@
+name: dynamic4
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  dyn:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: deps
+        continue-on-error: true
+        run: |
+          set +e
+          sudo apt-get update -qq
+          echo "wireshark-common wireshark-common/install-setuid boolean false" | sudo debconf-set-selections
+          sudo apt-get install -y -qq xvfb x11-utils x11-apps tcpdump tshark strace net-tools dnsutils curl ca-certificates procps file binutils python3 zstd imagemagick >/dev/null 2>&1
+          sudo apt-get install -y -qq tesseract-ocr tesseract-ocr-chi-sim >/dev/null 2>&1
+          sudo apt-get install -y -qq libnss3 libnspr4 libasound2t64 libatk1.0-0t64 libatk-bridge2.0-0t64 libatspi2.0-0t64 libcups2t64 libdrm2 libgbm1 libgtk-3-0t64 libpango-1.0-0 libcairo2 libx11-6 libx11-xcb1 libxcb-dri3-0 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 libxkbcommon0 libexpat1 libdbus-1-3 libglib2.0-0t64 libc6 libgcc-s1 libstdc++6 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1 libxkbcommon-x11-0 >/dev/null 2>&1
+          which tcpdump tshark strace Xvfb xwd convert tesseract curl python3
+          echo "=== runner egress ip ==="; curl -s -m 15 https://ifconfig.me; echo
+
+      - name: fetch + extract
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p work/out work/out/strace work/out/snap_before work/out/shots
+          cd work
+          curl -fL --retry 3 --connect-timeout 20 -o ab.deb "https://download.scholar.edu.cn/AcademicBrowser/AcademicBrowser1.9.deb"
+          curl -fL --retry 3 --connect-timeout 20 -o scholartools "https://download.scholar.edu.cn/tools/linux_amd64/scholartools"
+          sha256sum ab.deb scholartools | tee out/hashes.txt
+          sudo dpkg-deb -x ab.deb /
+          dpkg-deb -c ab.deb > out/files.txt
+          BIN=/opt/apps/cn.cas.client/files/bin
+          ls -l $BIN | head
+          echo "=== bundled nss libs ==="; ls -l $BIN/lib/libnss* $BIN/lib/libnspr* $BIN/lib/libsmime* 2>&1
+          echo "=== bundled libnssutil3 version defs ==="
+          readelf -V $BIN/lib/libnssutil3.so 2>/dev/null | grep -o 'NSSUTIL_[0-9.]*' | sort -u | tail -8
+          echo "=== system libnssutil3 version defs ==="
+          readelf -V /usr/lib/x86_64-linux-gnu/libnssutil3.so 2>/dev/null | grep -o 'NSSUTIL_[0-9.]*' | sort -u | tail -8
+          echo "=== system libnss3 version needs ==="
+          objdump -T /usr/lib/x86_64-linux-gnu/libnss3.so 2>/dev/null | grep -o 'NSSUTIL_[0-9.]*' | sort -u | tail -8
+
+      - name: NSS loader fix (system libnssutil3 first)
+        continue-on-error: true
+        run: |
+          set +e
+          cd work
+          BIN=/opt/apps/cn.cas.client/files/bin
+          cat > out/launch.sh <<'SH'
+          #!/bin/bash
+          BIN=/opt/apps/cn.cas.client/files/bin
+          export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:$BIN:$BIN/lib
+          export QT_QPA_PLATFORM_PLUGIN_PATH=$BIN/plugins
+          export CHROME_WRAPPER=$BIN/client
+          exec -a "$BIN/client" "$BIN/client" "$@"
+          SH
+          chmod +x out/launch.sh
+          echo "=== ldd BEFORE override ==="
+          LD_LIBRARY_PATH=$BIN:$BIN/lib ldd $BIN/client 2>&1 | grep -E 'nssutil|nss3|nspr|not found' | head -20
+          echo "=== ldd WITH system-first override ==="
+          LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:$BIN:$BIN/lib ldd $BIN/client 2>&1 | tee out/ldd_client_fixed.txt | grep -E 'nssutil|nss3|nspr|not found|libcef|libQt5Core' | head -30
+          echo "=== not found count: $(grep -c 'not found' out/ldd_client_fixed.txt) ==="
+          echo "=== exact nss resolution ==="
+          LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:$BIN:$BIN/lib ldd $BIN/client 2>&1 | grep -E 'libnss3|libnssutil3|libnspr4'
+          echo "=== versioned symbol check: chosen libnssutil3 exports NSSUTIL_3.101 ? ==="
+          readelf -V /usr/lib/x86_64-linux-gnu/libnssutil3.so 2>/dev/null | grep -c 'NSSUTIL_3.101'
+
+      - name: baseline snapshot
+        continue-on-error: true
+        run: |
+          set +e
+          cd work
+          sudo cat /etc/hosts > out/snap_before/hosts
+          sudo find /etc/ssl/certs -maxdepth 1 \( -type f -o -type l \) | sort > out/snap_before/ssl_certs.lst
+          (sudo ls -la /usr/local/share/ca-certificates) > out/snap_before/local_ca.lst 2>&1
+          (sudo find /root/.pki /root/.config -maxdepth 3 2>/dev/null | sort) > out/snap_before/root_cfg.lst 2>&1
+          cat /etc/resolv.conf > out/snap_before/resolv.conf
+          echo baseline-ok; wc -l out/snap_before/*.lst
+
+      - name: run CEF client under Xvfb with capture
+        continue-on-error: true
+        run: |
+          set +e
+          cd work
+          sudo tcpdump -i any -nn -s 0 -w out/cap.pcap '((tcp[tcpflags] & (tcp-syn|tcp-ack)) == tcp-syn) or port 53 or port 853 or port 443 or port 80 or port 784 or port 3478 or port 8080 or port 8444' > out/tcpdump.log 2>&1 &
+          TCPDUMP_PID=$!
+          sleep 3
+          Xvfb :99 -screen 0 1400x900x24 > out/xvfb.log 2>&1 &
+          XPID=$!
+          sleep 3
+          ( for i in $(seq 1 90); do echo "--- t=$i"; sudo ss -tnp 2>/dev/null | grep -vE '140\.82\.|20\.85\.|169\.254|Runner|hosted-compute|provjobd|github|azure' | head -40; sleep 2; done ) > out/ss.log 2>&1 &
+          SSPID=$!
+          ( for n in 15 40 70 100 140 180; do sleep 20; DISPLAY=:99 xwd -root -silent -out "out/shots/screen_$n.xwd" 2>/dev/null; DISPLAY=:99 xwininfo -root -tree > "out/shots/win_$n.txt" 2>&1; done ) > out/shot.log 2>&1 &
+          SPID=$!
+          echo "=== run: client via launch.sh (system nss first), 240s ==="
+          sudo env DISPLAY=:99 HOME=/root timeout -s TERM -k 10 240 bash out/launch.sh --no-sandbox --disable-gpu --disable-dev-shm-usage --user-data-dir=/root/.client-test-n4 > out/client.log 2>&1
+          echo "exit=$?"
+          sleep 2
+          echo "=== run2: strace 70s ==="
+          sudo env DISPLAY=:99 HOME=/root timeout -s TERM -k 10 70 strace -f -ff -e trace=connect,sendto,sendmsg,openat,execve -s 300 -o out/strace/client bash out/launch.sh --no-sandbox --disable-gpu --disable-dev-shm-usage --user-data-dir=/root/.client-test-n5 > out/client2.log 2>&1
+          echo "exit2=$?"
+          sleep 2
+          kill $SSPID 2>/dev/null; kill $SPID 2>/dev/null; sudo kill $TCPDUMP_PID 2>/dev/null; kill $XPID 2>/dev/null
+          sleep 2
+          echo "=== client.log tail ==="; tail -80 out/client.log
+          echo "=== client2.log tail ==="; tail -30 out/client2.log
+          echo "=== processes still alive ==="; ps -ef | grep -E 'client|cef|Xvfb' | grep -v grep | head -10
+          echo "=== shots ==="; ls -l out/shots | head -20
+
+      - name: OCR screenshots + window tree
+        continue-on-error: true
+        run: |
+          set +e
+          cd work
+          for f in out/shots/screen_*.xwd; do
+            [ -s "$f" ] || continue
+            b=${f%.xwd}
+            convert "$f" "$b.png" 2>/dev/null
+            tesseract "$b.png" "$b" -l eng+chi_sim --psm 6 >/dev/null 2>&1
+            echo "===== $f ($(stat -c%s "$f" 2>/dev/null) bytes) ====="
+            head -c 1500 "$b.txt" 2>/dev/null; echo
+          done | tee out/shots_ocr.txt
+          echo "=== window trees ==="; for f in out/shots/win_*.txt; do echo "--- $f"; head -20 "$f"; done | tee out/win_tree.txt
+          ls -l out/shots/*.png 2>/dev/null | head
+
+      - name: after-client diff + pcap analysis
+        continue-on-error: true
+        run: |
+          set +e
+          cd work
+          mkdir -p out/snap_after_client
+          sudo cat /etc/hosts > out/snap_after_client/hosts
+          sudo find /etc/ssl/certs -maxdepth 1 \( -type f -o -type l \) | sort > out/snap_after_client/ssl_certs.lst
+          (sudo ls -la /usr/local/share/ca-certificates) > out/snap_after_client/local_ca.lst 2>&1
+          (sudo find /root/.pki /root/.config -maxdepth 3 2>/dev/null | sort) > out/snap_after_client/root_cfg.lst 2>&1
+          diff -u out/snap_before/hosts out/snap_after_client/hosts > out/hosts_diff_client.txt 2>&1
+          diff -u out/snap_before/ssl_certs.lst out/snap_after_client/ssl_certs.lst > out/ssl_diff_client.txt 2>&1
+          diff -u out/snap_before/local_ca.lst out/snap_after_client/local_ca.lst > out/local_ca_diff_client.txt 2>&1
+          diff -u out/snap_before/root_cfg.lst out/snap_after_client/root_cfg.lst > out/root_cfg_diff.txt 2>&1
+          echo "=== hosts diff ==="; cat out/hosts_diff_client.txt
+          echo "=== ssl diff ==="; cat out/ssl_diff_client.txt
+          echo "=== local ca diff ==="; cat out/local_ca_diff_client.txt
+          echo "=== root config diff ==="; head -60 out/root_cfg_diff.txt
+          echo "=== DNS queries ==="; tshark -r out/cap.pcap -Y 'dns.flags.response==0' -T fields -e dns.qry.name -e dns.qry.type 2>/dev/null | sort | uniq -c | sort -rn | head -80 | tee out/dns_queries.txt
+          echo "=== TLS SNI ==="; tshark -r out/cap.pcap -Y 'tls.handshake.extensions_server_name' -T fields -e ip.dst -e tcp.dstport -e tls.handshake.extensions_server_name 2>/dev/null | sort | uniq -c | sort -rn | head -80 | tee out/sni.txt
+          echo "=== HTTP hosts ==="; tshark -r out/cap.pcap -Y 'http.request' -T fields -e ip.dst -e tcp.dstport -e http.host -e http.request.uri 2>/dev/null | sort | uniq -c | sort -rn | head -60 | tee out/http_hosts.txt
+          echo "=== destinations ==="; tshark -r out/cap.pcap -T fields -e ip.dst -e tcp.dstport -e udp.dstport 2>/dev/null | sort | uniq -c | sort -rn | head -80 | tee out/dests.txt
+          echo "=== strace connects ==="; grep -hE 'connect\(' out/strace/client* 2>/dev/null | grep -vE 'AF_UNIX|AF_NETLINK' | sed 's/^[0-9]* *//' | sort | uniq -c | sort -rn | head -80 | tee out/strace_connects.txt
+          echo "=== pcap size ==="; ls -l out/cap.pcap
+
+      - name: DoH queries from public cloud (edu.cn endpoint first)
+        continue-on-error: true
+        run: |
+          set +e
+          cd work
+          cat > out/doh_q.py <<'PY'
+          import socket, ssl, struct, json, time
+
+          def build(name, qtype):
+              h = struct.pack('!HHHHHH', 0x4242, 0x0100, 1, 0, 0, 0)
+              q = b''.join(bytes([len(p)]) + p.encode() for p in name.split('.')) + b'\x00'
+              return h + q + struct.pack('!HH', qtype, 1)
+
+          def skip(msg, off):
+              while True:
+                  l = msg[off]
+                  if l == 0: return off + 1
+                  if l & 0xc0 == 0xc0: return off + 2
+                  off += 1 + l
+
+          def parse(msg):
+              tid, flags, qd, an, ns, ar = struct.unpack('!HHHHHH', msg[:12])
+              off = 12
+              for _ in range(qd):
+                  off = skip(msg, off); off += 4
+              ans = []
+              for _ in range(an):
+                  off = skip(msg, off)
+                  rtype, rclass, ttl, rdlen = struct.unpack('!HHIH', msg[off:off+10]); off += 10
+                  rd = msg[off:off+rdlen]; off += rdlen
+                  if rtype == 1 and rdlen == 4: ans.append(['A', socket.inet_ntoa(rd), ttl])
+                  elif rtype == 28 and rdlen == 16: ans.append(['AAAA', socket.inet_ntop(socket.AF_INET6, rd), ttl])
+                  else: ans.append([rtype, rd.hex()[:40], ttl])
+              return {'rcode': flags & 0xf, 'an': an, 'answers': ans}
+
+          ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+
+          def query(host, ip, name, qtype=1, timeout=7):
+              t0 = time.time()
+              try:
+                  s = socket.create_connection((ip, 443), timeout=timeout)
+                  s = ctx.wrap_socket(s, server_hostname=host)
+                  body = build(name, qtype)
+                  req = ('POST /dns-query HTTP/1.1\r\nHost: %s\r\nContent-Type: application/dns-message\r\nAccept: application/dns-message\r\nContent-Length: %d\r\nConnection: close\r\n\r\n' % (host, len(body))).encode() + body
+                  s.sendall(req)
+                  data = b''
+                  while True:
+                      c = s.recv(65535)
+                      if not c: break
+                      data += c
+                  s.close()
+                  head, _, payload = data.partition(b'\r\n\r\n')
+                  status = head.split(b'\r\n')[0].decode('latin1')
+                  return {'ok': True, 't': round(time.time()-t0, 1), 'status': status,
+                          'peer': ip, 'len': len(payload), 'answer': parse(payload) if payload else None}
+              except Exception as e:
+                  return {'ok': False, 't': round(time.time()-t0, 1), 'peer': ip, 'err': repr(e)}
+
+          endpoints = {}
+          for host in ['doh.scholar.edu.cn', 'doh.scholar.work']:
+              try:
+                  ips = sorted({ai[4][0] for ai in socket.getaddrinfo(host, 443, socket.AF_INET)})
+              except Exception as e:
+                  ips = []
+                  print('RESOLVE-ERR', host, repr(e), flush=True)
+              endpoints[host] = ips
+              print('RESOLVE', host, ips, flush=True)
+
+          names = [('www.google.com',1),('scholar.google.com',1),('scholar.edu.cn',1),
+                   ('derp.scholar.edu.cn',1),('headscale.scholar.edu.cn',1),
+                   ('scholar.work',1),('github.com',1),('en.wikipedia.org',1),('www.google.com',28)]
+          for host, ips in endpoints.items():
+              for ip in ips[:2]:
+                  for name, qt in names:
+                      r = query(host, ip, name, qt)
+                      print('RESULT', host, ip, name, 'A' if qt == 1 else 'AAAA', json.dumps(r, ensure_ascii=False), flush=True)
+          PY
+          timeout 240 python3 out/doh_q.py 2>&1 | tee out/doh_results4.txt
+          echo "=== OpenSSL TLS detail doh.scholar.edu.cn ==="
+          timeout 20 openssl s_client -connect doh.scholar.edu.cn:443 -servername doh.scholar.edu.cn </dev/null 2>&1 | grep -E 'subject=|issuer=|Verify return code|CONNECTED' | head -8
+          echo "=== OpenSSL TLS detail doh.scholar.work ==="
+          timeout 20 openssl s_client -connect doh.scholar.work:443 -servername doh.scholar.work </dev/null 2>&1 | grep -E 'subject=|issuer=|Verify return code|CONNECTED' | head -8
+
+      - name: "in-package flow: DoH pinning via --resolve + Scholar CA bundle fetch"
+        continue-on-error: true
+        run: |
+          set +e
+          cd work
+          cat > out/pin_extract.py <<'PY'
+          import re, ast
+          pins = []
+          for line in open('out/doh_results4.txt', errors='replace'):
+              if not line.startswith('RESULT'): continue
+              if 'doh.scholar.edu.cn' not in line: continue
+              parts = line.split()
+              if len(parts) < 6 or parts[5] != "'A'": continue
+              m = re.search(r"'answers': (\[.*?\])", line)
+              if not m: continue
+              try:
+                  for a in ast.literal_eval(m.group(1)):
+                      if a[0] == 'A': pins.append((a[1], parts[3]))
+              except Exception: pass
+          seen = set()
+          for ip, name in pins:
+              if (ip, name) in seen: continue
+              seen.add((ip, name)); print(ip, name)
+          PY
+          python3 out/pin_extract.py > out/pin_entries4.txt 2> out/pin_err4.txt
+          cat out/pin_entries4.txt
+          echo "=== build local CA bundle: Scholar Root CA v1/v2 + system roots ==="
+          cat "$GITHUB_WORKSPACE"/certs/scholar_root_ca_v1.pem "$GITHUB_WORKSPACE"/certs/scholar_root_ca_v2.pem /etc/ssl/certs/ca-certificates.crt > out/ca_bundle.pem
+          grep -c 'BEGIN CERTIFICATE' out/ca_bundle.pem
+          echo "=== curl www.google.com pinned to DoH mapping IP (--resolve == hosts pin semantics) ==="
+          PINIP=$(awk '$2=="www.google.com"{print $1; exit}' out/pin_entries4.txt)
+          echo "PINIP=$PINIP"
+          if [ -n "$PINIP" ]; then
+            timeout 40 curl -sv -L --max-time 30 --connect-timeout 12 --resolve "www.google.com:443:$PINIP" --cacert out/ca_bundle.pem -o out/pinned_google.html -w 'code=%{http_code} size=%{size_download} ip=%{remote_ip} time=%{time_total}\n' https://www.google.com/ > out/pinned_google_curl.txt 2>&1
+          else
+            echo "NO PIN ENTRY FOR www.google.com" | tee out/pinned_google_curl.txt
+          fi
+          tail -25 out/pinned_google_curl.txt
+          echo "--- body head ---"; head -c 400 out/pinned_google.html 2>/dev/null; echo
+          echo "=== also probe every distinct DoH answer IP with TCP 443 (5s) ==="
+          awk '{print $2, $1}' out/pin_entries4.txt | sort -u | head -30 | while read name ip; do echo -n "$name -> $ip:443 "; timeout 5 bash -c "echo > /dev/tcp/$ip/443" 2>/dev/null && echo OPEN || echo FAIL; done | tee out/pin_ip_tcp.txt
+          echo "=== curl scholar.google.com pinned to DoH mapping IP ==="
+          SIP=$(awk '$2=="scholar.google.com"{print $1; exit}' out/pin_entries4.txt)
+          echo "SIP=$SIP"
+          if [ -n "$SIP" ]; then
+            timeout 40 curl -sv -L --max-time 30 --connect-timeout 12 --resolve "scholar.google.com:443:$SIP" --cacert out/ca_bundle.pem -o out/pinned_scholar.html -w 'code=%{http_code} size=%{size_download} ip=%{remote_ip} time=%{time_total}\n' https://scholar.google.com/ > out/pinned_scholar_curl.txt 2>&1
+          else
+            echo "NO PIN ENTRY FOR scholar.google.com" | tee out/pinned_scholar_curl.txt
+          fi
+          tail -20 out/pinned_scholar_curl.txt
+
+      - name: scholartools in-package flow (vendor tool writes hosts/CA itself)
+        continue-on-error: true
+        run: |
+          set +e
+          cd work
+          echo "=== scholartools --help ==="
+          sudo ./scholartools --help > out/scholartools_help4.txt 2>&1
+          head -60 out/scholartools_help4.txt
+          echo "=== hosts BEFORE install (tail) ==="; sudo tail -5 /etc/hosts
+          echo "=== run: scholartools install --non-interactive (150s, vendor writes hosts/CA) ==="
+          sudo timeout -s TERM -k 10 150 strace -f -e trace=execve,connect,openat,sendto,open -s 200 -o out/strace/scholartools4.log ./scholartools install --non-interactive > out/scholartools_install4.log 2>&1
+          echo "exit=$?"
+          tail -80 out/scholartools_install4.log
+          echo "=== hosts AFTER install (tail 30) ==="; sudo tail -30 /etc/hosts
+          echo "=== hosts diff (baseline -> after scholartools) ==="; sudo diff -u out/snap_before/hosts /etc/hosts > out/hosts_diff_scholartools4.txt 2>&1; grep -c '^+[0-9]' out/hosts_diff_scholartools4.txt; head -20 out/hosts_diff_scholartools4.txt
+          echo "=== CA dirs after install ==="; sudo ls -la /usr/local/share/ca-certificates 2>&1 | head -20; sudo ls -la /usr/local/etc/scholartools 2>&1 | head -20; sudo ls -la /usr/local/etc/scholartools/certs 2>&1 | head -20
+          echo "=== scholartools outbound connects ==="; grep -hE 'connect\(' out/strace/scholartools4.log 2>/dev/null | grep -vE 'AF_UNIX|AF_NETLINK' | sort | uniq -c | sort -rn | head -40
+          echo "=== resolve check after install ==="; getent hosts www.google.com | head -5
+          echo "=== curl www.google.com after vendor hosts pin, default trust ==="
+          timeout 40 curl -sv -L --max-time 30 --connect-timeout 12 -o out/st_body_www_google4.html -w 'code=%{http_code} size=%{size_download} ip=%{remote_ip} time=%{time_total}\n' https://www.google.com/ > out/st_curl_www_google4.txt 2>&1
+          tail -30 out/st_curl_www_google4.txt
+          echo "--- body head ---"; head -c 400 out/st_body_www_google4.html 2>/dev/null; echo
+          echo "=== curl www.google.com after vendor hosts pin, Scholar CA bundle ==="
+          timeout 40 curl -sv -L --max-time 30 --connect-timeout 12 --cacert out/ca_bundle.pem -o out/st_body_www_google4b.html -w 'code=%{http_code} size=%{size_download} ip=%{remote_ip} time=%{time_total}\n' https://www.google.com/ > out/st_curl_www_google4b.txt 2>&1
+          tail -20 out/st_curl_www_google4b.txt
+
+      - name: connectivity matrix from public cloud
+        continue-on-error: true
+        run: |
+          set +e
+          cd work
+          {
+          for h in scholar.edu.cn www.scholar.edu.cn scholar.work kj.scholar.work doh.scholar.work doh.scholar.edu.cn derp.scholar.edu.cn headscale.scholar.edu.cn; do
+            ip=$(getent ahostsv4 "$h" 2>/dev/null | awk 'NR==1{print $1}')
+            echo -n "$h -> ${ip:-NXDOMAIN} | "
+            if [ -n "$ip" ]; then
+              for p in 443 80; do echo -n "tcp$p="; timeout 6 bash -c "echo > /dev/tcp/$ip/$p" 2>/dev/null && echo -n OPEN || echo -n FAIL; echo -n " "; done
+            fi
+            echo
+          done
+          for ip in 205.164.50.200 205.164.50.201 205.164.50.205 205.164.50.207 205.164.50.209; do
+            echo -n "$ip:443="; timeout 5 bash -c "echo > /dev/tcp/$ip/443" 2>/dev/null && echo OPEN || echo FAIL
+          done
+          echo "=== plain DNS 53 to doh.scholar.edu.cn ==="
+          timeout 8 dig +time=3 +tries=1 @$(getent ahostsv4 doh.scholar.edu.cn | awk 'NR==1{print $1}') www.google.com A 2>&1 | tail -12
+          } | tee out/conn_matrix.txt
+
+      - name: assemble report
+        if: always()
+        continue-on-error: true
+        run: |
+          set +e
+          cd work
+          {
+            echo "================ RUNNER EGRESS ================"; curl -s -m 10 https://ifconfig.me; echo
+            echo "================ HASHES ================"; cat out/hashes.txt 2>/dev/null
+            echo "================ NSS FIX LDD ================"; cat out/ldd_client_fixed.txt 2>/dev/null | head -40
+            echo "================ CLIENT LOG ================"; tail -120 out/client.log 2>/dev/null; echo '--- client2 ---'; tail -50 out/client2.log 2>/dev/null
+            echo "================ SHOTS + OCR ================"; cat out/shot.log 2>/dev/null; cat out/shots_ocr.txt 2>/dev/null | head -150
+            echo "================ WINDOW TREE ================"; head -60 out/win_tree.txt 2>/dev/null
+            echo "================ HOSTS DIFF AFTER CLIENT ================"; cat out/hosts_diff_client.txt 2>/dev/null | head -60
+            echo "================ SSL DIR DIFF AFTER CLIENT ================"; cat out/ssl_diff_client.txt 2>/dev/null | head -40
+            echo "================ LOCAL CA DIFF AFTER CLIENT ================"; cat out/local_ca_diff_client.txt 2>/dev/null | head -40
+            echo "================ ROOT CFG DIFF ================"; head -40 out/root_cfg_diff.txt 2>/dev/null
+            echo "================ DNS QUERIES (client) ================"; cat out/dns_queries.txt 2>/dev/null
+            echo "================ TLS SNI (client) ================"; cat out/sni.txt 2>/dev/null
+            echo "================ HTTP HOSTS (client) ================"; cat out/http_hosts.txt 2>/dev/null
+            echo "================ DESTINATIONS (client) ================"; cat out/dests.txt 2>/dev/null | head -60
+            echo "================ STRACE CONNECTS (client) ================"; cat out/strace_connects.txt 2>/dev/null
+            echo "================ DOH4 RESULTS ================"; cat out/doh_results4.txt 2>/dev/null
+            echo "================ PIN ENTRIES ================"; cat out/pin_entries4.txt 2>/dev/null
+            echo "================ PIN IP TCP ================"; cat out/pin_ip_tcp.txt 2>/dev/null
+            echo "================ PINNED GOOGLE CURL ================"; tail -30 out/pinned_google_curl.txt 2>/dev/null
+            echo "================ PINNED SCHOLAR CURL ================"; tail -20 out/pinned_scholar_curl.txt 2>/dev/null
+            echo "================ SCHOLARTOOLS VENDOR FLOW ================"; head -40 out/scholartools_help4.txt 2>/dev/null; echo '--- install log tail ---'; tail -40 out/scholartools_install4.log 2>/dev/null; echo '--- hosts diff count ---'; grep -c '^+[0-9]' out/hosts_diff_scholartools4.txt 2>/dev/null; head -15 out/hosts_diff_scholartools4.txt 2>/dev/null; echo '--- getent www.google.com ---'; getent hosts www.google.com | head -3
+            echo "================ CONN MATRIX ================"; cat out/conn_matrix.txt 2>/dev/null
+          } > out/REPORT4.txt 2>&1
+          wc -c out/REPORT4.txt
+          head -80 out/REPORT4.txt
+
+      - name: upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dynreport4
+          path: |
+            work/out/REPORT4.txt
+            work/out/cap.pcap
+            work/out/

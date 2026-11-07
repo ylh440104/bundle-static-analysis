@@ -1,0 +1,172 @@
+name: dynamic5
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  dyn5:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: deps
+        continue-on-error: true
+        run: |
+          set +e
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb x11-utils x11-apps strace net-tools curl ca-certificates procps file binutils python3 zstd >/dev/null 2>&1
+          sudo apt-get install -y -qq libnss3 libnspr4 libasound2t64 libatk1.0-0t64 libatk-bridge2.0-0t64 libatspi2.0-0t64 libcups2t64 libdrm2 libgbm1 libgtk-3-0t64 libpango-1.0-0 libcairo2 libx11-6 libx11-xcb1 libxcb-dri3-0 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 libxkbcommon0 libexpat1 libdbus-1-3 libglib2.0-0t64 libc6 libgcc-s1 libstdc++6 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1 libxkbcommon-x11-0 >/dev/null 2>&1
+          echo "=== runner egress ip ==="; curl -s -m 15 https://ifconfig.me; echo
+
+      - name: fetch + extract + package layout
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p work/out work/out/strace5
+          cd work
+          curl -fL --retry 3 --connect-timeout 20 -o ab.deb "https://download.scholar.edu.cn/AcademicBrowser/AcademicBrowser1.9.deb"
+          curl -fL --retry 3 --connect-timeout 20 -o scholartools "https://download.scholar.edu.cn/tools/linux_amd64/scholartools"
+          sha256sum ab.deb scholartools | tee out/hashes5.txt
+          sudo dpkg-deb -x ab.deb /
+          dpkg-deb -c ab.deb > out/files5.txt
+          BIN=/opt/apps/cn.cas.client/files/bin
+          echo '=== package tree (depth 4) ==='
+          find /opt/apps/cn.cas.client -maxdepth 4 | head -120 | tee out/tree5.txt
+          echo '=== webapp / zip / config / inject / template / log files ==='
+          find /opt/apps/cn.cas.client \( -iname '*webapp*' -o -iname '*.zip' -o -iname '*config*' -o -iname '*inject*' -o -iname '*template*' -o -iname '*.log' -o -iname '*.ini' -o -iname '*.conf' -o -iname '*.json' \) 2>/dev/null | head -80 | tee out/layout5.txt
+          echo '=== startclient ==='; sudo cat $BIN/startclient > out/startclient5.txt 2>&1; cat out/startclient5.txt
+          echo '=== qt.conf ==='; sudo cat $BIN/qt.conf > out/qtconf5.txt 2>&1; cat out/qtconf5.txt
+          cat > out/launch.sh <<'SH'
+          #!/bin/bash
+          BIN=/opt/apps/cn.cas.client/files/bin
+          export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:$BIN:$BIN/lib
+          export QT_QPA_PLATFORM_PLUGIN_PATH=$BIN/plugins
+          export CHROME_WRAPPER=$BIN/client
+          exec -a "$BIN/client" "$BIN/client" "$@"
+          SH
+          chmod +x out/launch.sh
+
+      - name: package read-only keyword scan
+        continue-on-error: true
+        run: |
+          set +e
+          cd work
+          BIN=/opt/apps/cn.cas.client/files/bin
+          KW='uuid|short_id|shortid|password|passwd|psk|obfs|hysteria|tuic|vless|vmess|trojan|shadowsocks|sing-box|singbox|8444|100\.64\.0\.|tunnel\.local|42\.247\.111\.|205\.164\.|inject|startclient|config\.ini|inbound|outbound|server_port|server_name|socks|proxy'
+          for f in $BIN/client $BIN/libclient_ui.so.1.0.0 $BIN/libzinc.so.3.1.6 $BIN/wtpd $BIN/startclient; do
+            [ -e "$f" ] || continue
+            b=$(basename "$f")
+            echo "===== $b ($(stat -c%s "$f") bytes) ====="
+            strings -n 5 "$f" 2>/dev/null | grep -inE "$KW" | head -150
+          done > out/kw_bin5.txt 2>&1
+          echo '=== data/config files keyword scan ==='
+          for f in $BIN/resources.pak $BIN/*.pak $BIN/*.json $BIN/*.ini $BIN/*.conf $BIN/default.desktop; do
+            [ -e "$f" ] || continue
+            echo "----- $f"
+            grep -ainE "$KW" "$f" 2>/dev/null | head -50
+          done > out/kw_data5.txt 2>&1
+          echo '=== files under package whose names match config/cred keywords ==='
+          find /opt/apps/cn.cas.client -type f \( -iname '*config*' -o -iname '*cred*' -o -iname '*node*' -o -iname '*proxy*' -o -iname '*server*' \) 2>/dev/null | head -60 > out/kw_files5.txt
+          echo '=== any plaintext config.ini in package ==='
+          find /opt/apps/cn.cas.client -iname 'config.ini' -exec sh -c 'echo "--- $1"; cat "$1"' _ {} \; 2>/dev/null | head -80 | tee out/pkg_config5.txt
+          echo '=== binary keyword hits (head) ==='; head -100 out/kw_bin5.txt
+          echo '=== data keyword hits (head) ==='; head -60 out/kw_data5.txt
+
+      - name: run client and capture runtime config.ini
+        continue-on-error: true
+        run: |
+          set +e
+          cd work
+          Xvfb :99 -screen 0 1400x900x24 > out/xvfb5.log 2>&1 &
+          XPID=$!
+          sleep 3
+          echo '=== run as runner user (HOME=/home/runner), 90s ==='
+          DISPLAY=:99 HOME=/home/runner timeout -s TERM -k 10 90 bash out/launch.sh --no-sandbox --disable-gpu --disable-dev-shm-usage --user-data-dir=/home/runner/.client-test-n5 > out/client5_runner.log 2>&1
+          echo "exit_runner=$?"
+          sleep 2
+          echo '=== run as root (sudo HOME=/root), 90s ==='
+          sudo env DISPLAY=:99 HOME=/root timeout -s TERM -k 10 90 bash out/launch.sh --no-sandbox --disable-gpu --disable-dev-shm-usage --user-data-dir=/root/.client-test-n5 > out/client5_root.log 2>&1
+          echo "exit_root=$?"
+          sleep 2
+          kill $XPID 2>/dev/null
+          echo '=== locate config.ini candidates (both homes) ==='
+          { sudo find /home/runner/.config /root/.config -maxdepth 4 -iname 'config.ini' 2>/dev/null; sudo find /home/runner/.config /root/.config -maxdepth 3 -iname '*client*' 2>/dev/null; } | sort -u | tee out/cfg_paths5.txt
+          echo '=== dump config.ini ==='
+          for f in /home/runner/.config/client/config.ini /root/.config/client/config.ini; do
+            echo "===== $f ====="
+            sudo cat "$f" 2>&1
+            echo
+          done | tee out/config_ini5.txt
+          echo '=== list client config dirs ==='
+          for d in /home/runner/.config/client /root/.config/client; do echo "--- $d"; sudo find "$d" -maxdepth 3 -type f -exec ls -l {} \; 2>/dev/null; done | tee out/cfg_dir5.txt
+          echo '=== logs under client dirs / package ==='
+          { sudo find /home/runner/.config/client /root/.config/client -maxdepth 4 -type f 2>/dev/null; sudo find /opt/apps/cn.cas.client -maxdepth 5 -type f -iname '*log*' 2>/dev/null; } | head -60 | tee out/log_files5.txt
+          echo '=== keyword scan of runtime config + logs ==='
+          KW='uuid|short_id|shortid|password|passwd|psk|obfs|hysteria|tuic|vless|vmess|trojan|shadowsocks|sing-box|singbox|8444|100\.64\.0\.|tunnel\.local|42\.247\.111\.|205\.164\.|inbound|outbound|server_port|server_name|socks|proxy'
+          { for f in $(cat out/cfg_dir5.txt | awk '{print $NF}' | grep -E '/(client|config)' | sort -u) $(cat out/log_files5.txt); do
+              [ -f "$f" ] || continue
+              echo "----- $f"
+              sudo grep -ainE "$KW" "$f" 2>/dev/null | head -60
+              echo "----- $f (full, if small)"
+              [ $(sudo stat -c%s "$f" 2>/dev/null || echo 999999) -lt 4096 ] && sudo cat "$f"
+            done; } > out/config_kw5.txt 2>&1
+          echo '=== client logs tail ==='; tail -30 out/client5_runner.log; echo '--- root ---'; tail -30 out/client5_root.log
+          echo '=== config keyword hits ==='; head -120 out/config_kw5.txt
+
+      - name: strace outbound of client (no 8444 expected)
+        continue-on-error: true
+        run: |
+          set +e
+          cd work
+          Xvfb :98 -screen 0 1200x800x24 > out/xvfb5b.log 2>&1 &
+          XPID=$!
+          sleep 3
+          sudo env DISPLAY=:98 HOME=/root timeout -s TERM -k 10 70 strace -f -ff -e trace=connect,sendto,sendmsg -s 300 -o out/strace5/client bash out/launch.sh --no-sandbox --disable-gpu --disable-dev-shm-usage --user-data-dir=/root/.client-test-n5b > out/client5_strace.log 2>&1
+          echo "exit_strace=$?"
+          sudo kill $XPID 2>/dev/null
+          echo '=== all client connects ==='
+          grep -hE 'connect\(' out/strace5/client* 2>/dev/null | grep -vE 'AF_UNIX|AF_NETLINK' | sed 's/^[0-9]* *//' | sort | uniq -c | sort -rn | head -100 | tee out/connects5.txt
+          echo '=== 8444 / tunnel / 100.64 / 205.164 hits in strace ==='
+          grep -hE '8444|tunnel|100\.64\.|205\.164' out/strace5/client* 2>/dev/null | head -30 | tee out/strace5_hits.txt
+          echo '=== tcp ports contacted (derived) ==='
+          grep -hoE 'htons\([0-9]+\)' out/strace5/client* 2>/dev/null | sort | uniq -c | sort -rn | head -20
+
+      - name: assemble report
+        if: always()
+        continue-on-error: true
+        run: |
+          set +e
+          cd work
+          {
+            echo "================ RUNNER EGRESS ================"; curl -s -m 10 https://ifconfig.me; echo
+            echo "================ HASHES ================"; cat out/hashes5.txt 2>/dev/null
+            echo "================ PACKAGE TREE ================"; cat out/tree5.txt 2>/dev/null
+            echo "================ LAYOUT MATCHES ================"; cat out/layout5.txt 2>/dev/null
+            echo "================ STARTC LIENT ================"; cat out/startclient5.txt 2>/dev/null
+            echo "================ QT CONF ================"; cat out/qtconf5.txt 2>/dev/null
+            echo "================ PACKAGE CONFIG INI ================"; cat out/pkg_config5.txt 2>/dev/null
+            echo "================ BINARY KEYWORD HITS ================"; head -300 out/kw_bin5.txt 2>/dev/null
+            echo "================ DATA KEYWORD HITS ================"; head -150 out/kw_data5.txt 2>/dev/null
+            echo "================ FILE NAME MATCHES ================"; cat out/kw_files5.txt 2>/dev/null
+            echo "================ CLIENT LOG runner ================"; tail -60 out/client5_runner.log 2>/dev/null
+            echo "================ CLIENT LOG root ================"; tail -60 out/client5_root.log 2>/dev/null
+            echo "================ CONFIG PATHS ================"; cat out/cfg_paths5.txt 2>/dev/null
+            echo "================ CONFIG INI CONTENT ================"; cat out/config_ini5.txt 2>/dev/null
+            echo "================ CLIENT CONFIG DIR ================"; cat out/cfg_dir5.txt 2>/dev/null
+            echo "================ LOG FILES ================"; cat out/log_files5.txt 2>/dev/null
+            echo "================ RUNTIME CONFIG/LOG KEYWORD SCAN ================"; head -300 out/config_kw5.txt 2>/dev/null
+            echo "================ STRACE CONNECTS ================"; cat out/connects5.txt 2>/dev/null
+            echo "================ STRACE 8444/TUNNEL HITS ================"; cat out/strace5_hits.txt 2>/dev/null
+          } > out/REPORT5.txt 2>&1
+          wc -c out/REPORT5.txt
+          head -100 out/REPORT5.txt
+
+      - name: upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dynreport5
+          path: |
+            work/out/REPORT5.txt
+            work/out/
